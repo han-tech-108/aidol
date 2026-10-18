@@ -1,0 +1,13 @@
+{
+  "name": "aidol",
+  "private": true,
+  "type": "module",
+  "workspaces": ["server", "avatar"],
+  "scripts": {
+    "dev": "npm run dev -w server & npm run dev -w avatar",
+    "dev:server": "npm run dev -w server",
+    "dev:avatar": "npm run dev -w avatar",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w avatar",
+    "build": "npm run build -w avatar"
+  }
+}

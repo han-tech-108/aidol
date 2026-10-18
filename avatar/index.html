@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AIドル アバター</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; }
+      body { background: linear-gradient(180deg, #2b2f4a, #6d5a8c); font-family: system-ui, sans-serif; }
+      body.transparent { background: transparent; }
+      canvas { display: block; }
+      #notice { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; color: #fff;
+        background: rgba(0,0,0,.45); font-size: 20px; text-align: center; padding: 24px; cursor: pointer; white-space: pre-line; }
+      #notice.show { display: flex; }
+      #subtitle { position: fixed; left: 50%; bottom: 6%; transform: translateX(-50%); max-width: 80%; color: #fff; font-size: 28px;
+        font-weight: 700; text-shadow: 0 0 6px #000, 0 0 2px #000; text-align: center; display: none; }
+      body.subtitles #subtitle { display: block; }
+    </style>
+  </head>
+  <body>
+    <div id="notice"></div>
+    <div id="subtitle"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

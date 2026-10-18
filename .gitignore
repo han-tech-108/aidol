@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.env
+avatar/public/models/*.vrm
+logs/
