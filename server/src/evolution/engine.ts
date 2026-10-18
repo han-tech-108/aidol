@@ -2,7 +2,7 @@ import type { EvolutionStatus } from "../protocol.ts";
 import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { readJson, writeJson } from "../store.ts";
-import { describeStats, score, type ActiveVersions, type DomainId, type Metrics } from "./metrics.ts";
+import { describeStats, score, scoreMode, type ActiveVersions, type DomainId, type Metrics } from "./metrics.ts";
 import { VersionedStore, type Versioned } from "./versioned.ts";
 
 /** 候補の評価点が、元の版のこの割合以上なら採用する（少し悪くても探索を続けるため 1 未満） */
@@ -200,8 +200,12 @@ export class EvolutionEngine {
     const d = this.domains.get(a.domain)!;
     const store = this.stores.get(a.domain)!;
     this.state.active = null;
-    const base = score(this.metrics.stats(a.domain, String(a.baseline)), d.minMinutes);
-    const cand = score(this.metrics.stats(a.domain, String(a.candidate)), early ? 0 : d.minMinutes);
+    const baseStats = this.metrics.stats(a.domain, String(a.baseline));
+    const candStats = this.metrics.stats(a.domain, String(a.candidate));
+    // 両方に視聴者数のデータがあるときだけ、視聴者あたりで比べる
+    const mode = scoreMode(baseStats, candStats);
+    const base = score(baseStats, d.minMinutes, mode);
+    const cand = score(candStats, early ? 0 : d.minMinutes, mode);
     if (base !== null && cand !== null && cand < base * KEEP_RATIO) {
       const v = store.restore(a.baseline)!;
       await d.apply(v.value);

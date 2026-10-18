@@ -16,6 +16,39 @@ export interface Exposure {
   positives: number;
   /** その項目への不満コメント */
   negatives: number;
+  /** スーパーチャット・メンバー加入などの件数 */
+  gifts?: number;
+  /** 同時視聴者数が分かっていた時間（分） */
+  watchedMinutes?: number;
+  /** 同時視聴者数 × 分（視聴者数の合計） */
+  viewerMinutes?: number;
+  /** その間の同時視聴者数の増減の合計 */
+  viewerChange?: number;
+  /** アーカイブの視聴維持率から求めた、視聴者が離れた割合の合計（配信後に加算） */
+  retentionDrop?: number;
+  /** 視聴維持率を対応づけられた時間（分） */
+  retentionMinutes?: number;
+}
+
+/** 評価点の出し方。viewers は同時視聴者数で割った値（視聴者が多い時間帯に有利にならない） */
+export type ScoreMode = "comments" | "viewers";
+
+/** 同時視聴者数で比べられるだけのデータがあるか */
+export const hasViewerData = (e: Exposure | undefined) => !!e && (e.watchedMinutes ?? 0) >= e.minutes / 2 && (e.viewerMinutes ?? 0) > 0;
+
+/** 比べる版がすべて視聴者数のデータを持っていれば viewers で比べる */
+export function scoreMode(...es: (Exposure | undefined)[]): ScoreMode {
+  return es.every(hasViewerData) ? "viewers" : "comments";
+}
+
+/** 配信1回分の記録。アーカイブの視聴維持率を、そのとき使っていた版に対応づけるために使う。 */
+export interface LiveSession {
+  videoId: string;
+  /** 配信の開始時刻（アーカイブの0秒） */
+  startedAt: string;
+  /** 使っていた版が変わった時刻 */
+  segments: { at: string; active: ActiveVersions }[];
+  retentionDone?: boolean;
 }
 
 export interface AppearanceRequest {
@@ -61,13 +94,21 @@ export function classify(text: string): Partial<Record<DomainId, "positive" | "n
  * 1時間あたりの評価点。盛り上がり（コメント数）を土台に、褒め言葉で加点、不満で大きく減点する。
  * 使った時間が短すぎるものは比べられないので null。
  */
-export function score(e: Exposure | undefined, minMinutes: number): number | null {
+export function score(e: Exposure | undefined, minMinutes: number, mode: ScoreMode = scoreMode(e)): number | null {
   if (!e || e.minutes < minMinutes) return null;
-  return ((e.comments + 5 * e.positives - 10 * e.negatives) / e.minutes) * 60;
+  const reactions = e.comments + 5 * e.positives - 10 * e.negatives + 20 * (e.gifts ?? 0);
+  if (mode === "comments" || !hasViewerData(e)) return (reactions / e.minutes) * 60;
+  // 視聴者100人・1時間あたりの反応。視聴者が増えていく版は加点、減っていく版は減点
+  const watched = e.watchedMinutes!;
+  const avgViewers = e.viewerMinutes! / watched;
+  const perViewer = ((reactions * (watched / e.minutes)) / e.viewerMinutes!) * 60 * 100;
+  const growth = Math.max(-0.5, Math.min(0.5, (e.viewerChange ?? 0) / Math.max(1, avgViewers) / (watched / 60)));
+  return perViewer * (1 + growth);
 }
 
 interface MetricsData {
   exposure: Record<string, Exposure>;
+  sessions?: LiveSession[];
   requests: AppearanceRequest[];
   recent: { at: string; author: string; text: string }[];
 }
@@ -83,9 +124,76 @@ export class Metrics {
     this.data = readJson<MetricsData>(file, { exposure: {}, requests: [], recent: [] });
   }
 
-  /** 配信中に1分ごとに呼ぶ。 */
-  tick(active: ActiveVersions, minutes = 1) {
-    for (const d of DOMAINS) this.at(d, active[d]).minutes += minutes;
+  private lastViewers: number | null = null;
+
+  /** 配信中に1分ごとに呼ぶ。viewers は今の同時視聴者数（分からなければ null）。 */
+  tick(active: ActiveVersions, minutes = 1, viewers: number | null = null) {
+    const change = viewers !== null && this.lastViewers !== null ? viewers - this.lastViewers : 0;
+    for (const d of DOMAINS) {
+      const e = this.at(d, active[d]);
+      e.minutes += minutes;
+      if (viewers !== null) {
+        e.watchedMinutes = (e.watchedMinutes ?? 0) + minutes;
+        e.viewerMinutes = (e.viewerMinutes ?? 0) + viewers * minutes;
+        e.viewerChange = (e.viewerChange ?? 0) + change;
+      }
+    }
+    this.lastViewers = viewers;
+    const session = this.data.sessions?.at(-1);
+    if (session && !session.retentionDone && JSON.stringify(session.segments.at(-1)?.active) !== JSON.stringify(active)) {
+      session.segments.push({ at: new Date().toISOString(), active: { ...active } });
+    }
+    this.save();
+  }
+
+  /** YouTube の配信が見つかったとき。同じ配信なら何もしない。 */
+  startSession(videoId: string, startedAt: string, active: ActiveVersions) {
+    const sessions = (this.data.sessions ??= []);
+    if (sessions.some((s) => s.videoId === videoId)) return;
+    sessions.push({ videoId, startedAt, segments: [{ at: new Date().toISOString(), active: { ...active } }] });
+    this.data.sessions = sessions.slice(-30);
+    this.lastViewers = null;
+    this.save();
+  }
+
+  /** 視聴維持率をまだ取り込んでいない配信 */
+  pendingSessions(): LiveSession[] {
+    return (this.data.sessions ?? []).filter((s) => !s.retentionDone);
+  }
+
+  /**
+   * アーカイブの視聴維持率を、各時点で使っていた版に振り分ける。
+   * curve は動画の経過割合（0〜1）ごとの視聴率。
+   */
+  addRetention(videoId: string, curve: { ratio: number; watch: number }[], durationSeconds: number) {
+    const session = this.data.sessions?.find((s) => s.videoId === videoId);
+    if (!session) return;
+    const start = Date.parse(session.startedAt);
+    const points = [...curve].sort((a, b) => a.ratio - b.ratio);
+    for (let i = 1; i < points.length; i++) {
+      const prev = points[i - 1]!;
+      const cur = points[i]!;
+      const minutes = ((cur.ratio - prev.ratio) * durationSeconds) / 60;
+      // 区間の真ん中の時刻で、どの版を使っていたかを決める
+      const at = start + ((prev.ratio + cur.ratio) / 2) * durationSeconds * 1000;
+      const seg = [...session.segments].reverse().find((s) => Date.parse(s.at) <= at) ?? session.segments[0];
+      if (!seg || minutes <= 0) continue;
+      for (const d of DOMAINS) {
+        const e = this.at(d, seg.active[d]);
+        e.retentionDrop = (e.retentionDrop ?? 0) + Math.max(0, prev.watch - cur.watch);
+        e.retentionMinutes = (e.retentionMinutes ?? 0) + minutes;
+      }
+    }
+    session.retentionDone = true;
+    this.save();
+  }
+
+  /** スーパーチャット・メンバー加入など */
+  observeGift(active: ActiveVersions) {
+    for (const d of DOMAINS) {
+      const e = this.at(d, active[d]);
+      e.gifts = (e.gifts ?? 0) + 1;
+    }
     this.save();
   }
 
@@ -136,9 +244,16 @@ export class Metrics {
 
 /** AI に渡すための、版ごとの反応の一覧（日本語） */
 export function describeStats(m: Metrics, d: DomainId, minMinutes = 30): string {
-  const rows = Object.entries(m.all(d)).map(([v, e]) => {
-    const s = score(e, minMinutes);
-    return `- 版${v}: ${Math.round(e.minutes)}分、コメント${e.comments}件、褒め${e.positives}件、不満${e.negatives}件${s === null ? "（比較にはまだ短い）" : `、評価点${s.toFixed(1)}/時`}`;
+  const all = m.all(d);
+  const mode = scoreMode(...Object.values(all).filter((e) => e.minutes >= minMinutes));
+  const rows = Object.entries(all).map(([v, e]) => {
+    const s = score(e, minMinutes, mode);
+    const parts = [`${Math.round(e.minutes)}分`, `コメント${e.comments}件`, `褒め${e.positives}件`, `不満${e.negatives}件`];
+    if (e.gifts) parts.push(`スパチャ・メンバー${e.gifts}件`);
+    if (hasViewerData(e)) parts.push(`平均同時視聴者${Math.round(e.viewerMinutes! / e.watchedMinutes!)}人`, `視聴者の増減${e.viewerChange! >= 0 ? "+" : ""}${e.viewerChange}人`);
+    if (e.retentionMinutes) parts.push(`アーカイブの離脱 10分あたり${((e.retentionDrop! / e.retentionMinutes) * 1000).toFixed(1)}%`);
+    return `- 版${v}: ${parts.join("、")}${s === null ? "（比較にはまだ短い）" : `、評価点${s.toFixed(1)}`}`;
   });
-  return rows.length ? rows.join("\n") : "（まだデータがありません）";
+  const note = mode === "viewers" ? "評価点は視聴者100人・1時間あたりの反応（視聴者の増減も加味）" : "評価点は1時間あたりの反応";
+  return rows.length ? `${rows.join("\n")}\n（${note}。コメント+褒め×5−不満×10+スパチャ等×20）` : "（まだデータがありません）";
 }

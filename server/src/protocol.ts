@@ -19,6 +19,8 @@ export interface Comment {
   source: "youtube" | "tiktok" | "admin";
   author: string;
   text: string;
+  /** スーパーチャット・メンバー加入など（例: スーパーチャット ¥500） */
+  gift?: string;
 }
 
 /** アバターに1文ずつ送る発話。 */
@@ -158,6 +160,8 @@ export interface AdminState {
   look: Look;
   looks: (Look & { available: boolean })[];
   evolution: EvolutionStatus;
+  /** YouTube 連携（未設定なら null） */
+  youtube: { videoId: string | null; viewers: number | null } | null;
 }
 
 export type ServerToAdmin =

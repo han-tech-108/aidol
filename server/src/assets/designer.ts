@@ -4,7 +4,7 @@ import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync } fro
 import path from "node:path";
 import { askJson } from "../ai.ts";
 import { readJson, writeJson } from "../store.ts";
-import { describeStats, score, type Metrics } from "../evolution/metrics.ts";
+import { describeStats, score, scoreMode, type Metrics } from "../evolution/metrics.ts";
 import { PARTS, type ColorEdit, type Look, type LookEdits, type Part } from "../protocol.ts";
 import { applyEdits, type ModelBuilder } from "./builder.ts";
 import { clamp } from "../evolution/domains/bounds.ts";
@@ -145,13 +145,14 @@ export class Designer {
   /** 反応の悪い新作を引退させる。引退させた見た目を返す。 */
   evaluate(otherLooks: Look[]): Look[] {
     const stats = this.opts.metrics.all("look");
-    const others = otherLooks.map((l) => score(stats[l.id], MIN_MINUTES)).filter((x): x is number => x !== null);
+    const mode = scoreMode(...[...otherLooks, ...this.data.looks].map((l) => stats[l.id]).filter((e) => e && e.minutes >= MIN_MINUTES));
+    const others = otherLooks.map((l) => score(stats[l.id], MIN_MINUTES, mode)).filter((x): x is number => x !== null);
     if (!others.length) return [];
     const median = [...others].sort((a, b) => a - b)[Math.floor(others.length / 2)]!;
     const retired: Look[] = [];
     for (const l of this.data.looks) {
       if (l.retired) continue;
-      const s = score(stats[l.id], MIN_MINUTES);
+      const s = score(stats[l.id], MIN_MINUTES, mode);
       if (s !== null && s < median * RETIRE_RATIO) {
         l.retired = true;
         retired.push(l);
@@ -166,8 +167,9 @@ export class Designer {
     const active = this.data.looks.filter((l) => !l.retired);
     if (active.length <= MAX_ACTIVE) return;
     const stats = this.opts.metrics.all("look");
+    const mode = scoreMode(...active.map((l) => stats[l.id]));
     active
-      .sort((a, b) => (score(stats[a.id], 0) ?? Infinity) - (score(stats[b.id], 0) ?? Infinity))
+      .sort((a, b) => (score(stats[a.id], 0, mode) ?? Infinity) - (score(stats[b.id], 0, mode) ?? Infinity))
       .slice(0, active.length - MAX_ACTIVE)
       .forEach((l) => (l.retired = true));
   }
