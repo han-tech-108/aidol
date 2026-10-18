@@ -22,6 +22,7 @@ import { DEFAULT_MODEL, modelDomain, modelEdits, type ModelParams } from "./evol
 import { ModelBuilder, mergeEdits } from "./assets/builder.ts";
 import { Designer } from "./assets/designer.ts";
 import { appendFileSync, mkdirSync } from "node:fs";
+import { YouTubeClient, YouTubeLive, youtubeConfigFromEnv } from "./youtube.ts";
 import type {
   AdminState,
   AdminToServer,
@@ -170,6 +171,7 @@ function adminState(): AdminState {
     look: stylist.current,
     looks: [...wardrobe.looks, ...designer.looks].map((l) => ({ ...l, available: available.has(l.id) })),
     evolution: engine.status(),
+    youtube: youtube ? { videoId: youtube.video?.videoId ?? null, viewers: youtube.viewers } : null,
   };
 }
 
@@ -203,13 +205,20 @@ let current: AbortController | null = null;
 let draining = false;
 
 function enqueue(c: Comment) {
+  if (c.gift) metrics.observeGift(engine.activeVersions());
   if (containsNgWord(c.text, constitution.ngWords) || containsNgWord(c.author, constitution.ngWords)) {
     log("warn", `NGワードを含むコメントを除外: ${c.author}`);
     return;
   }
-  if (metrics.observe(c, engine.activeVersions())) scheduleRestyle();
-  pending.push(c);
-  while (pending.length > MAX_PENDING) pending.shift();
+  if (c.text && metrics.observe(c, engine.activeVersions())) scheduleRestyle();
+  // スーパーチャット・メンバー加入へのお礼は、普通のコメントより先に・必ず返す
+  if (c.gift) pending.splice(pending.filter((p) => p.gift).length, 0, c);
+  else pending.push(c);
+  while (pending.length > MAX_PENDING) {
+    const i = pending.findIndex((p) => !p.gift);
+    if (i < 0) break;
+    pending.splice(i, 1);
+  }
   void drain();
 }
 
@@ -227,9 +236,10 @@ async function respondTo(c: Comment) {
   const turnId = randomUUID();
   const controller = new AbortController();
   current = controller;
-  log("info", `コメント (${c.source}) ${c.author}: ${c.text}`);
+  log("info", `コメント (${c.source}) ${c.author}${c.gift ? ` [${c.gift}]` : ""}: ${c.text}`);
 
-  const userContent = `<comment author="${escapeAttr(c.author)}">${escapeText(c.text)}</comment>`;
+  const gift = c.gift ? ` gift="${escapeAttr(c.gift)}"` : "";
+  const userContent = `<comment author="${escapeAttr(c.author)}"${gift}>${escapeText(c.text)}</comment>`;
   const splitter = new SentenceSplitter();
   let emotion: Emotion = "neutral";
   let index = 0;
@@ -348,7 +358,7 @@ function capture(): Promise<CaptureImage[]> {
 // ---- 配信中は1分ごとに記録と自己改善を進める ----
 setInterval(async () => {
   if (!avatars.size) return;
-  metrics.tick(engine.activeVersions());
+  metrics.tick(engine.activeVersions(), 1, youtube?.viewers ?? null);
   await engine.tick();
   for (const l of designer.evaluate(stylist.available().filter((x) => !x.generated))) {
     log("warn", `反応が良くなかったので「${l.name}」を引退させました`);
@@ -363,6 +373,44 @@ function escapeAttr(s: string) {
 function escapeText(s: string) {
   return s.replace(/[&<>]/g, (ch) => `&#${ch.charCodeAt(0)};`);
 }
+
+// ---- YouTube：コメントと視聴データ ----
+const ytConfig = youtubeConfigFromEnv();
+const ytClient = ytConfig ? new YouTubeClient(ytConfig) : null;
+const youtube = ytClient
+  ? new YouTubeLive(ytClient, {
+      onComment: enqueue,
+      onVideo: (v) => {
+        if (v.actualStartTime) metrics.startSession(v.videoId, v.actualStartTime, engine.activeVersions());
+        toAdmins(adminState());
+      },
+      log,
+    })
+  : null;
+
+/** 配信が終わって集計が出たら、アーカイブの視聴維持率を版ごとに振り分ける */
+async function collectRetention() {
+  if (!ytClient?.hasOAuth) return;
+  for (const s of metrics.pendingSessions()) {
+    try {
+      const v = await ytClient.video(s.videoId);
+      if (!v) {
+        metrics.addRetention(s.videoId, [], 0);
+        continue;
+      }
+      const endedHoursAgo = v.actualEndTime ? (Date.now() - Date.parse(v.actualEndTime)) / 3_600_000 : 0;
+      if (!v.actualEndTime || endedHoursAgo < 48 || !v.durationSeconds) continue; // 集計が出るまで待つ
+      const curve = await ytClient.retention(s.videoId, s.startedAt);
+      if (curve.length || endedHoursAgo > 24 * 7) {
+        metrics.addRetention(s.videoId, curve, v.durationSeconds);
+        log("info", `配信 ${s.videoId} の視聴維持率を取り込みました（${curve.length}点）`);
+      }
+    } catch (e) {
+      log("warn", `視聴維持率の取得に失敗: ${(e as Error).message}`);
+    }
+  }
+}
+setInterval(() => void collectRetention(), 6 * 3_600_000);
 
 // ---- サーバー ----
 const http = createServer((req, res) => {
@@ -471,5 +519,10 @@ http.listen(PORT, async () => {
   ttsAvailable = await tts.isAvailable();
   console.log(`aidol server: ws://localhost:${PORT}`);
   console.log(ttsAvailable ? "VOICEVOX に接続しました" : "VOICEVOX が見つからないため、音声なし（口パクのみ）で動作します");
+  if (youtube) {
+    void youtube.start();
+    void collectRetention();
+    console.log(ytClient!.hasOAuth ? "YouTube（OAuth）: 自分のライブ配信を探します" : "YouTube（API キー）: 指定の配信を探します");
+  }
   if (!process.env.ANTHROPIC_API_KEY) console.warn("ANTHROPIC_API_KEY が未設定です。.env に設定してください");
 });

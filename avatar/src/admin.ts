@@ -60,6 +60,11 @@ function renderState(st: AdminState) {
     }),
   );
   renderEvolution(st.evolution);
+  $("youtube").textContent = !st.youtube
+    ? "YouTube: 未設定（.env に YOUTUBE_API_KEY か OAuth を設定）"
+    : st.youtube.videoId
+      ? `YouTube: 配信 ${st.youtube.videoId}・同時視聴者 ${st.youtube.viewers ?? "-"}人`
+      : "YouTube: ライブ中の配信を探しています";
 }
 
 let paused = false;
