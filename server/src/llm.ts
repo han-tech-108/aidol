@@ -17,6 +17,11 @@ export class Brain {
     private maxHistory = 20,
   ) {}
 
+  /** 性格の改善などでシステムプロンプトが変わったとき */
+  setSystem(system: string) {
+    this.system = system;
+  }
+
   async *respond(userContent: string, signal: AbortSignal): AsyncGenerator<string> {
     const messages: Anthropic.MessageParam[] = [...this.history, { role: "user", content: userContent }];
     const stream = this.client.beta.messages.stream(

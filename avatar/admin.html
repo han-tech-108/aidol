@@ -22,6 +22,11 @@
       .look { border: 1px solid #ccc; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
       .look.current { border-color: #3558d6; background: #eef2ff; }
       .look.missing { color: #aaa; }
+      .look.generated::before { content: "★ "; color: #d08a00; }
+      #domains { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+      #domains td { border-top: 1px solid #eee; padding: 6px 4px; vertical-align: top; }
+      #domains td.why { color: #555; }
+      #domains tr.testing td:first-child::after { content: " 試験中"; color: #3558d6; font-size: 11px; }
     </style>
   </head>
   <body>
@@ -56,13 +61,14 @@
       <p class="hint">シーンを変えるとAIが見た目を選びます。配信中は「着替えて」「ポニテ見たい」などのコメントにも反応します。</p>
     </section>
     <section>
-      <h2>顔の継続改良</h2>
+      <h2>AIの自己改善</h2>
       <div class="row">
-        <span id="face-version">顔: -</span>
-        <button id="face-review">今すぐレビュー</button>
-        <button id="face-rollback">前の版に戻す</button>
+        <span id="evo-summary">-</span>
+        <button id="evo-pause">一時停止</button>
+        <button id="design">新しい見た目を今すぐ作る</button>
       </div>
-      <p class="hint">配信中は一定時間ごとに各表情を撮影し、AIが調整します。反応が前の版より悪ければ自動で戻ります。</p>
+      <table id="domains"></table>
+      <p class="hint">配信中、AIが性格・声・表情・動き・モデルを1つずつ少しだけ変えて試し、視聴者の反応が下がれば自動で元に戻します。新しい衣装・髪型も定期的に自分で作り、反応が悪いものは引退させます。記録は data/evolution/changelog.md にあります。</p>
     </section>
     <section>
       <h2>動作を試す</h2>

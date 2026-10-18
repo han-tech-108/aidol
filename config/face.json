@@ -1,16 +1,24 @@
 {
-  "version": 1,
   "emotions": {
     "neutral": {},
-    "joy": { "happy": 0.75 },
-    "fun": { "relaxed": 0.7 },
-    "angry": { "angry": 0.7 },
-    "sorrow": { "sad": 0.7 },
-    "surprised": { "surprised": 0.8 }
+    "joy": {
+      "happy": 0.75
+    },
+    "fun": {
+      "relaxed": 0.7
+    },
+    "angry": {
+      "angry": 0.7
+    },
+    "sorrow": {
+      "sad": 0.7
+    },
+    "surprised": {
+      "surprised": 0.8
+    }
   },
   "mouthGain": 1.0,
   "blinkMin": 1.5,
   "blinkMax": 6.0,
-  "gazeJitter": 0.25,
-  "note": "初期値"
+  "gazeJitter": 0.25
 }
