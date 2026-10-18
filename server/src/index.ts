@@ -1,18 +1,27 @@
 import { createServer } from "node:http";
-import { existsSync } from "node:fs";
+import { createReadStream, existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { Brain } from "./llm.ts";
-import { VoicevoxClient } from "./tts.ts";
-import { buildSystemPrompt, loadCharacter } from "./character.ts";
+import { MODEL } from "./ai.ts";
+import { VoicevoxClient, type VoiceParams } from "./tts.ts";
+import { buildSystemPrompt, loadCharacter, type Persona } from "./character.ts";
 import { containsNgWord } from "./filter.ts";
 import { parseTags, SentenceSplitter } from "./tags.ts";
-import { PreferenceTracker } from "./preferences.ts";
 import { Stylist, type StyleTrigger, type Wardrobe } from "./stylist.ts";
-import { FaceTuner } from "./face.ts";
 import { readJson } from "./store.ts";
+import { Metrics } from "./evolution/metrics.ts";
+import { EvolutionEngine } from "./evolution/engine.ts";
+import { personaDomain, type Exchange } from "./evolution/domains/persona.ts";
+import { DEFAULT_VOICE, voiceDomain } from "./evolution/domains/voice.ts";
+import { faceDomain } from "./evolution/domains/face.ts";
+import { DEFAULT_MOTION, motionDomain } from "./evolution/domains/motion.ts";
+import { DEFAULT_MODEL, modelDomain, modelEdits, type ModelParams } from "./evolution/domains/model.ts";
+import { ModelBuilder, mergeEdits } from "./assets/builder.ts";
+import { Designer } from "./assets/designer.ts";
+import { appendFileSync, mkdirSync } from "node:fs";
 import type {
   AdminState,
   AdminToServer,
@@ -21,6 +30,8 @@ import type {
   Comment,
   Emotion,
   FaceParams,
+  Look,
+  MotionParams,
   ServerToAdmin,
   ServerToAvatar,
   SpeakMessage,
@@ -31,26 +42,37 @@ const PORT = Number(process.env.PORT ?? 8787);
 const MAX_PENDING = 5;
 const ROOT = path.join(here, "../..");
 const DATA = path.join(ROOT, "data");
-const MODEL = process.env.CLAUDE_MODEL ?? "claude-opus-5-5";
-/** 配信中、この時間ごとに顔のレビューを自動で行う（0 で無効） */
-const FACE_REVIEW_HOURS = Number(process.env.FACE_REVIEW_HOURS ?? 3);
+const GENERATED = path.join(DATA, "generated");
+/** 新しい衣装・髪型を企画する間隔（配信時間・分） */
+const DESIGN_INTERVAL = Number(process.env.DESIGN_INTERVAL_MINUTES ?? 240);
 
-const character = loadCharacter(path.join(ROOT, "config/character.json"));
-const brain = new Brain(buildSystemPrompt(character), MODEL, (process.env.CLAUDE_EFFORT ?? "low") as "low");
-const prefs = new PreferenceTracker(path.join(DATA, "preferences.json"));
+// ---- キャラクター・見た目・声 ----
+const { constitution, persona: initialPersona } = loadCharacter(path.join(ROOT, "config/character.json"));
+const brain = new Brain(buildSystemPrompt(constitution, initialPersona), MODEL, (process.env.CLAUDE_EFFORT ?? "low") as "low");
+const metrics = new Metrics(path.join(DATA, "metrics.json"));
 const wardrobe = readJson<Wardrobe>(path.join(ROOT, "config/wardrobe.json"), { defaultLook: "", minMinutesBetweenChanges: 10, scenes: [], looks: [] });
+const builder = new ModelBuilder(path.join(ROOT, "avatar/public"), GENERATED);
+const designer = new Designer({
+  file: path.join(DATA, "wardrobe-generated.json"),
+  briefsFile: path.join(DATA, "creation-briefs.md"),
+  wishlistFile: path.join(DATA, "wishlist.md"),
+  outDir: GENERATED,
+  builder,
+  metrics,
+  baseLooks: () => wardrobe.looks,
+  generatorCmd: process.env.MODEL_GENERATOR_CMD,
+});
 const stylist = new Stylist(
   wardrobe,
-  (look) => existsSync(path.join(ROOT, "avatar/public", look.file)),
-  prefs,
-  MODEL,
+  () => [...wardrobe.looks, ...designer.looks],
+  (look) => builder.exists(look.file),
+  metrics,
   path.join(DATA, "wishlist.md"),
 );
-const face = new FaceTuner(path.join(DATA, "face"), readJson<FaceParams>(path.join(ROOT, "config/face.json"), {} as FaceParams), prefs, MODEL);
-const tts = new VoicevoxClient(
-  process.env.VOICEVOX_URL ?? "http://127.0.0.1:50021",
-  Number(process.env.VOICEVOX_SPEAKER ?? 1),
-);
+const tts = new VoicevoxClient(process.env.VOICEVOX_URL ?? "http://127.0.0.1:50021", {
+  speaker: Number(process.env.VOICEVOX_SPEAKER ?? 1),
+  ...DEFAULT_VOICE,
+});
 
 // ---- 接続管理 ----
 const avatars = new Set<WebSocket>();
@@ -70,15 +92,84 @@ function log(level: "info" | "warn" | "error", message: string) {
   console[level === "info" ? "log" : level](`[${level}] ${message}`);
   toAdmins({ type: "log", level, at: new Date().toISOString(), message });
 }
+designer.onLog = log;
+
+// ---- 自己改善エンジン ----
+const transcript: Exchange[] = [];
+let motion: MotionParams = DEFAULT_MOTION;
+let face: FaceParams;
+let model: ModelParams = DEFAULT_MODEL;
+
+const engine = new EvolutionEngine(path.join(DATA, "evolution"), metrics, () => stylist.current.id);
+engine.register(
+  personaDomain({
+    initial: initialPersona,
+    constitution,
+    transcript: () => transcript,
+    apply: (p: Persona) => brain.setSystem(buildSystemPrompt(constitution, p)),
+  }),
+);
+engine.register(voiceDomain({ initial: tts.params, styles: () => tts.styles(), apply: (v: VoiceParams) => (tts.params = v) }));
+engine.register(
+  faceDomain({
+    initial: readJson<FaceParams>(path.join(ROOT, "config/face.json"), {} as FaceParams),
+    capture: () => capture(),
+    apply: (f) => {
+      face = f;
+      toAvatars({ type: "face", params: f });
+    },
+  }),
+);
+engine.register(
+  motionDomain({
+    initial: DEFAULT_MOTION,
+    apply: (m) => {
+      motion = m;
+      toAvatars({ type: "motion", params: m });
+    },
+  }),
+);
+engine.register(
+  modelDomain({
+    initial: DEFAULT_MODEL,
+    capture: () => capture(),
+    apply: (m) => {
+      model = m;
+      if (avatars.size) toAvatars({ type: "look", look: resolveLook(stylist.current) });
+    },
+    onSuggestions: (items) => {
+      mkdirSync(DATA, { recursive: true });
+      appendFileSync(path.join(DATA, "creation-briefs.md"), `\n## ${new Date().toISOString()} モデルの形の改善（AI のレビューより）\n${items.map((s) => `- ${s}`).join("\n")}\n`);
+      log("info", `モデルの形の改善点 ${items.length}件を制作指示書に追加しました`);
+    },
+  }),
+);
+engine.onEvent = (e) => {
+  log(e.kind === "error" ? "error" : e.kind === "reverted" ? "warn" : "info", `自己改善[${e.domain}] ${e.message}`);
+  toAdmins(adminState());
+};
+
+/** 見た目にモデルの調整をかけた、実際に読み込むファイルを決める */
+function resolveLook(look: Look): Look {
+  const source = look.generated?.source ?? look.file;
+  const edits = mergeEdits(look.generated?.edits, modelEdits(model));
+  try {
+    return { ...look, file: builder.build(source, edits) };
+  } catch (e) {
+    log("error", `見た目のファイルを作れませんでした: ${(e as Error).message}`);
+    return look;
+  }
+}
 
 function adminState(): AdminState {
+  const available = new Set(stylist.available().map((l) => l.id));
   return {
     type: "state",
     scene: stylist.scene,
     scenes: wardrobe.scenes,
     look: stylist.current,
-    looks: wardrobe.looks.map((l) => ({ ...l, available: stylist.available().includes(l) })),
-    faceVersion: face.params.version,
+    looks: [...wardrobe.looks, ...designer.looks].map((l) => ({ ...l, available: available.has(l.id) })),
+    evolution: engine.status(),
   };
 }
 
@@ -112,11 +203,11 @@ let current: AbortController | null = null;
 let draining = false;
 
 function enqueue(c: Comment) {
-  if (containsNgWord(c.text, character.ngWords) || containsNgWord(c.author, character.ngWords)) {
+  if (containsNgWord(c.text, constitution.ngWords) || containsNgWord(c.author, constitution.ngWords)) {
     log("warn", `NGワードを含むコメントを除外: ${c.author}`);
     return;
   }
-  if (prefs.observe(c, stylist.current.id, face.params.version)) scheduleRestyle();
+  if (metrics.observe(c, engine.activeVersions())) scheduleRestyle();
   pending.push(c);
   while (pending.length > MAX_PENDING) pending.shift();
   void drain();
@@ -149,13 +240,13 @@ async function respondTo(c: Comment) {
   const handle = (raw: string) => {
     const s = parseTags(raw);
     if (!s.text) return;
-    if (containsNgWord(s.text, character.ngWords)) {
+    if (containsNgWord(s.text, constitution.ngWords)) {
       log("error", `生成文にNGワードがあったため発話を中止: ${s.text}`);
       controller.abort();
       return;
     }
     emotion = s.emotion ?? emotion;
-    spoken += raw;
+    spoken += s.text;
     const i = index++;
     const e = emotion;
     const job = toSpeak(turnId, i, s.text, e, s.gestures);
@@ -175,13 +266,14 @@ async function respondTo(c: Comment) {
     }
     for (const sentence of splitter.flush()) handle(sentence);
   } catch (e) {
-    if (controller.signal.aborted) {
-      brain.remember(userContent, spoken);
-    } else {
-      log("error", `応答の生成に失敗: ${(e as Error).message}`);
-    }
+    if (controller.signal.aborted) brain.remember(userContent, spoken);
+    else log("error", `応答の生成に失敗: ${(e as Error).message}`);
   }
   await chain;
+  if (spoken) {
+    transcript.push({ at: new Date().toISOString(), comment: `${c.author}: ${c.text}`, reply: spoken });
+    if (transcript.length > 100) transcript.shift();
+  }
   if (current === controller) current = null;
 }
 
@@ -201,13 +293,17 @@ function scheduleRestyle() {
   restyleTimer = setTimeout(() => void restyle("request"), 45_000);
 }
 
+function wearNow(look: Look) {
+  toAvatars({ type: "look", look: resolveLook(look) });
+}
+
 async function restyle(trigger: StyleTrigger) {
   try {
     const d = await stylist.decide(trigger);
     if (!d) return;
     log("info", `スタイリスト: ${d.look.name}（${d.reason}）`);
     if (d.changed) {
-      toAvatars({ type: "look", look: d.look });
+      wearNow(d.look);
       await say(d.line);
     }
     toAdmins(adminState());
@@ -216,7 +312,19 @@ async function restyle(trigger: StyleTrigger) {
   }
 }
 
-// ---- 顔の継続改良 ----
+async function designNewLook() {
+  try {
+    const look = await designer.design(engine.status().liveMinutes);
+    if (look) {
+      log("info", `新しい見た目「${look.name}」を作りました: ${look.generated?.rationale ?? ""}`);
+      toAdmins(adminState());
+    }
+  } catch (e) {
+    log("error", `新しい見た目の制作に失敗: ${(e as Error).message}`);
+  }
+}
+
+// ---- 顔の撮影（表情・モデルの改善に使う） ----
 const captures = new Map<string, (images: CaptureImage[]) => void>();
 
 function capture(): Promise<CaptureImage[]> {
@@ -230,49 +338,23 @@ function capture(): Promise<CaptureImage[]> {
     }, 30_000);
     captures.set(requestId, (images) => {
       clearTimeout(timer);
+      captures.delete(requestId);
       resolve(images);
     });
     ws.send(JSON.stringify({ type: "capture", requestId } satisfies ServerToAvatar));
   });
 }
 
-let reviewing = false;
-let minutesSinceReview = 0;
-
-async function reviewFace() {
-  if (reviewing) return;
-  reviewing = true;
-  minutesSinceReview = 0;
-  try {
-    log("info", "顔のレビューを始めます（各表情を撮影中）");
-    const result = await face.review(await capture(), stylist.current);
-    if (result.kind === "updated") {
-      log("info", `顔を版${result.params.version}に更新: ${result.assessment}`);
-      if (result.modelSuggestions.length) log("info", `モデル修正の提案 ${result.modelSuggestions.length}件を data/face/model-suggestions.md に記録`);
-    } else {
-      log("warn", `顔を前の版に戻しました: ${result.reason}`);
-    }
-    toAvatars({ type: "face", params: face.params });
-    toAdmins(adminState());
-  } catch (e) {
-    log("error", `顔のレビューに失敗: ${(e as Error).message}`);
-  } finally {
-    reviewing = false;
-  }
-}
-
-// 配信中（アバター接続中）は1分ごとに見た目の表示時間を数え、反応が悪い版は自動で戻す
-setInterval(() => {
+// ---- 配信中は1分ごとに記録と自己改善を進める ----
+setInterval(async () => {
   if (!avatars.size) return;
-  prefs.tick(stylist.current.id, face.params.version);
-  minutesSinceReview++;
-  const rolled = face.checkRollback();
-  if (rolled?.kind === "rolled-back") {
-    log("warn", `顔を前の版に戻しました: ${rolled.reason}`);
-    toAvatars({ type: "face", params: face.params });
-    toAdmins(adminState());
+  metrics.tick(engine.activeVersions());
+  await engine.tick();
+  for (const l of designer.evaluate(stylist.available().filter((x) => !x.generated))) {
+    log("warn", `反応が良くなかったので「${l.name}」を引退させました`);
+    if (stylist.current.id === l.id) void restyle("manual");
   }
-  if (FACE_REVIEW_HOURS > 0 && minutesSinceReview >= FACE_REVIEW_HOURS * 60) void reviewFace();
+  if (!engine.status().paused && designer.due(engine.status().liveMinutes, DESIGN_INTERVAL)) await designNewLook();
 }, 60_000);
 
 function escapeAttr(s: string) {
@@ -284,9 +366,17 @@ function escapeText(s: string) {
 
 // ---- サーバー ----
 const http = createServer((req, res) => {
-  if (req.url === "/health") {
+  const url = new URL(req.url ?? "/", "http://x");
+  if (url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, avatars: avatars.size, tts: ttsAvailable }));
+    return;
+  }
+  // AI が作った VRM を配信する
+  const m = /^\/generated\/([\w-]+\.vrm)$/.exec(url.pathname);
+  if (m && existsSync(path.join(GENERATED, m[1]!))) {
+    res.writeHead(200, { "Content-Type": "model/gltf-binary", "Access-Control-Allow-Origin": "*", "Cache-Control": "max-age=31536000, immutable" });
+    createReadStream(path.join(GENERATED, m[1]!)).pipe(res);
     return;
   }
   res.writeHead(404).end();
@@ -298,8 +388,9 @@ wss.on("connection", (ws, req) => {
   if (role === "avatar") {
     avatars.add(ws);
     log("info", `アバターが接続しました（${avatars.size}）`);
-    ws.send(JSON.stringify({ type: "look", look: stylist.current } satisfies ServerToAvatar));
-    ws.send(JSON.stringify({ type: "face", params: face.params } satisfies ServerToAvatar));
+    ws.send(JSON.stringify({ type: "look", look: resolveLook(stylist.current) } satisfies ServerToAvatar));
+    ws.send(JSON.stringify({ type: "face", params: face } satisfies ServerToAvatar));
+    ws.send(JSON.stringify({ type: "motion", params: motion } satisfies ServerToAvatar));
     ws.on("close", () => avatars.delete(ws));
     ws.on("message", (data) => {
       let msg: AvatarToServer;
@@ -330,6 +421,12 @@ wss.on("connection", (ws, req) => {
       case "say":
         await say(msg.text);
         break;
+      case "gesture":
+        toAvatars({ type: "pose", gesture: msg.gesture });
+        break;
+      case "stop":
+        stopAll();
+        break;
       case "scene":
         stylist.scene = msg.scene;
         log("info", `シーンを「${msg.scene}」に変更`);
@@ -341,35 +438,36 @@ wss.on("connection", (ws, req) => {
       case "wear": {
         const look = stylist.wear(msg.lookId);
         if (look) {
-          toAvatars({ type: "look", look });
+          wearNow(look);
           log("info", `手動で着替え: ${look.name}`);
         }
         toAdmins(adminState());
         break;
       }
-      case "face-review":
-        void reviewFace();
+      case "design":
+        await designNewLook();
         break;
-      case "face-rollback": {
-        const p = face.rollback();
-        if (p) {
-          toAvatars({ type: "face", params: p });
-          log("warn", `顔を版${p.version}に戻しました`);
-          toAdmins(adminState());
-        }
+      case "evolve":
+        await engine.runNow(msg.domain);
         break;
-      }
-      case "gesture":
-        toAvatars({ type: "pose", gesture: msg.gesture });
+      case "revert":
+        await engine.revert(msg.domain);
         break;
-      case "stop":
-        stopAll();
+      case "freeze":
+        engine.setFrozen(msg.domain, msg.frozen);
+        toAdmins(adminState());
+        break;
+      case "pause-evolution":
+        engine.setPaused(msg.paused);
+        log("warn", msg.paused ? "自己改善を一時停止しました" : "自己改善を再開しました");
+        toAdmins(adminState());
         break;
     }
   });
 });
 
 http.listen(PORT, async () => {
+  await engine.applyAll();
   ttsAvailable = await tts.isAvailable();
   console.log(`aidol server: ws://localhost:${PORT}`);
   console.log(ttsAvailable ? "VOICEVOX に接続しました" : "VOICEVOX が見つからないため、音声なし（口パクのみ）で動作します");

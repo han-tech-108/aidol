@@ -1,9 +1,9 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { VRMLoaderPlugin, VRMUtils, type VRM } from "@pixiv/three-vrm";
-import { DEFAULT_FACE, Performer } from "./motion.ts";
+import { DEFAULT_FACE, DEFAULT_MOTION, Performer } from "./motion.ts";
 import { SpeechPlayer } from "./speech.ts";
-import { EMOTIONS, type AvatarToServer, type CaptureImage, type FaceParams, type ServerToAvatar } from "../../server/src/protocol.ts";
+import { EMOTIONS, type AvatarToServer, type CaptureImage, type FaceParams, type MotionParams, type ServerToAvatar } from "../../server/src/protocol.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -65,6 +65,10 @@ const unlockAudio = () => {
 // ---- モデル（見た目の切り替え） ----
 let performer: Performer | null = null;
 let face: FaceParams = DEFAULT_FACE;
+let motion: MotionParams = DEFAULT_MOTION;
+/** AI が作った見た目（/generated/…）はサーバーから配信される */
+const serverHttp = serverUrl.replace(/^ws/, "http");
+const resolveFile = (file: string) => (file.startsWith("/generated/") ? serverHttp + file : file);
 let currentFile = "";
 let loadingFile = "";
 
@@ -78,7 +82,7 @@ async function wear(file: string, lookId = file) {
   if (file === currentFile || file === loadingFile) return;
   loadingFile = file;
   try {
-    const gltf = await loader.loadAsync(file);
+    const gltf = await loader.loadAsync(resolveFile(file));
     if (loadingFile !== file) return; // 読み込み中に別の見た目が指定された
     const vrm = gltf.userData.vrm as VRM;
     VRMUtils.removeUnnecessaryVertices(gltf.scene);
@@ -90,7 +94,7 @@ async function wear(file: string, lookId = file) {
       canvas.style.opacity = "0";
       await sleep(300);
     }
-    const next = new Performer(vrm, camera, face);
+    const next = new Performer(vrm, camera, face, motion);
     if (old) {
       next.setEmotion(old.currentEmotion);
       scene.remove(old.vrm.scene);
@@ -191,6 +195,10 @@ function connect() {
       case "face":
         face = msg.params;
         if (performer) performer.face = face;
+        break;
+      case "motion":
+        motion = msg.params;
+        if (performer) performer.motion = motion;
         break;
       case "capture":
         send({ type: "capture-result", requestId: msg.requestId, images: await captureFaces() });

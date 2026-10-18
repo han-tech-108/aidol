@@ -1,29 +1,52 @@
 import { readFileSync } from "node:fs";
 import { EMOTIONS, GESTURES } from "./protocol.ts";
 
-export interface Character {
+/** AI が変えてはいけない部分（名前・安全のルール・NGワード） */
+export interface Constitution {
   name: string;
   firstPerson: string;
-  profile: string;
-  speakingStyle: string[];
   rules: string[];
   ngWords: string[];
 }
 
-export function loadCharacter(path: string): Character {
-  return JSON.parse(readFileSync(path, "utf8")) as Character;
+/** AI が自分で改善していく性格・話し方 */
+export interface Persona {
+  profile: string;
+  speakingStyle: string[];
+  catchphrases: string[];
+  favoriteTopics: string[];
+  /** 1回の返事の文字数の目安 */
+  replyLength: number;
 }
 
-/** キャラ設定からシステムプロンプトを組み立てる。配信中は変えないので、毎回同じ文字列になる。 */
-export function buildSystemPrompt(c: Character): string {
+export type CharacterFile = Constitution & Partial<Persona>;
+
+export function loadCharacter(path: string): { constitution: Constitution; persona: Persona } {
+  const c = JSON.parse(readFileSync(path, "utf8")) as CharacterFile;
+  return {
+    constitution: { name: c.name, firstPerson: c.firstPerson, rules: c.rules, ngWords: c.ngWords },
+    persona: {
+      profile: c.profile ?? "",
+      speakingStyle: c.speakingStyle ?? [],
+      catchphrases: c.catchphrases ?? [],
+      favoriteTopics: c.favoriteTopics ?? [],
+      replyLength: c.replyLength ?? 80,
+    },
+  };
+}
+
+/** キャラ設定からシステムプロンプトを組み立てる。 */
+export function buildSystemPrompt(c: Constitution, p: Persona): string {
+  const list = (xs: string[]) => xs.map((s) => `- ${s}`).join("\n");
   return `あなたはライブ配信中のバーチャルアイドル「${c.name}」です。一人称は「${c.firstPerson}」。
-${c.profile}
+${p.profile}
 
 話し方:
-${c.speakingStyle.map((s) => `- ${s}`).join("\n")}
-
-守ること:
-${c.rules.map((s) => `- ${s}`).join("\n")}
+${list(p.speakingStyle)}
+- 1回の返事は1〜3文、合計${p.replyLength}文字以内を目安に短く
+${p.catchphrases.length ? `\n口ぐせ（ときどき自然に使う）:\n${list(p.catchphrases)}\n` : ""}${p.favoriteTopics.length ? `\n好きな話題:\n${list(p.favoriteTopics)}\n` : ""}
+守ること（最優先）:
+${list(c.rules)}
 
 出力の形式:
 - 返事は声に出して読み上げられます。絵文字、顔文字、記号の装飾、URL、箇条書きは使わないでください。

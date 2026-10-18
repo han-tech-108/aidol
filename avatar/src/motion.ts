@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { VRM, VRMHumanBoneName } from "@pixiv/three-vrm";
-import { FACE_EXPRESSIONS, type Emotion, type FaceParams, type Gesture, type Vowel } from "../../server/src/protocol.ts";
+import { FACE_EXPRESSIONS, type Emotion, type FaceParams, type Gesture, type MotionParams, type Vowel } from "../../server/src/protocol.ts";
 
 type Pose = Partial<Record<VRMHumanBoneName, [number, number, number]>>;
 
@@ -51,7 +51,6 @@ const GESTURES: Record<Gesture, GestureDef> = {
 
 /** サーバーから顔の調整値が届くまでの初期値（config/face.json と同じ）。 */
 export const DEFAULT_FACE: FaceParams = {
-  version: 0,
   emotions: {
     neutral: {},
     joy: { happy: 0.75 },
@@ -64,8 +63,10 @@ export const DEFAULT_FACE: FaceParams = {
   blinkMin: 1.5,
   blinkMax: 6,
   gazeJitter: 0.25,
-  note: "",
 };
+
+/** 体の動きの調整値（AI が配信の反応を見て少しずつ変える） */
+export const DEFAULT_MOTION: MotionParams = { gestureScale: 1, gestureSpeed: 1, idleScale: 1, speakingNod: 1 };
 
 const VOWEL_EXPRESSIONS: Record<Vowel, Record<string, number>> = {
   a: { aa: 0.9 },
@@ -97,6 +98,7 @@ export class Performer {
     readonly vrm: VRM,
     private camera: THREE.Camera,
     public face: FaceParams = DEFAULT_FACE,
+    public motion: MotionParams = DEFAULT_MOTION,
   ) {
     if (vrm.lookAt) vrm.lookAt.target = this.gaze;
   }
@@ -106,7 +108,10 @@ export class Performer {
   }
 
   gesture(g: Gesture) {
-    this.active.push({ def: GESTURES[g], started: this.time });
+    const def = GESTURES[g];
+    const speed = this.motion.gestureSpeed;
+    // 速さを変えるときは、身振りの時間を縮めて同じ動きを速く再生する
+    this.active.push({ def: { duration: def.duration / speed, pose: (p, e) => def.pose(p, e * speed) }, started: this.time });
   }
 
   setEmotion(e: Emotion) {
@@ -123,13 +128,14 @@ export class Performer {
   }
 
   private updateBones(t: number, level: number) {
-    const breath = Math.sin(t * 1.6);
+    const { idleScale: k, speakingNod, gestureScale } = this.motion;
+    const breath = Math.sin(t * 1.6) * k;
     const pose: Pose = {
-      hips: [0, 0.04 * Math.sin(t * 0.5), 0.015 * Math.sin(t * 0.37)],
-      spine: [0.015 * breath, 0, 0.02 * Math.sin(t * 0.37 + 1)],
+      hips: [0, 0.04 * k * Math.sin(t * 0.5), 0.015 * k * Math.sin(t * 0.37)],
+      spine: [0.015 * breath, 0, 0.02 * k * Math.sin(t * 0.37 + 1)],
       chest: [0.015 * breath, 0, 0],
       neck: [0, 0, 0],
-      head: [0.03 * Math.sin(t * 0.7) + 0.06 * level, 0.07 * Math.sin(t * 0.29), 0.025 * Math.sin(t * 0.53)],
+      head: [0.03 * k * Math.sin(t * 0.7) + 0.06 * speakingNod * level, 0.07 * k * Math.sin(t * 0.29), 0.025 * k * Math.sin(t * 0.53)],
       leftUpperArm: [0, 0, -0.03 * breath],
       rightUpperArm: [0, 0, 0.03 * breath],
     };
@@ -141,7 +147,7 @@ export class Performer {
       const p = elapsed / g.def.duration;
       const env = smooth(Math.min(1, elapsed / 0.25, (g.def.duration - elapsed) / 0.35));
       for (const [bone, r] of Object.entries(g.def.pose(p, elapsed)) as [VRMHumanBoneName, [number, number, number]][]) {
-        add(pose, bone, r, env);
+        add(pose, bone, r, env * gestureScale);
       }
     }
 
