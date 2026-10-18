@@ -1,9 +1,11 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { VRMLoaderPlugin, VRMUtils, type VRM } from "@pixiv/three-vrm";
-import { Performer } from "./motion.ts";
+import { DEFAULT_FACE, Performer } from "./motion.ts";
 import { SpeechPlayer } from "./speech.ts";
-import type { ServerToAvatar } from "../../server/src/protocol.ts";
+import { EMOTIONS, type AvatarToServer, type CaptureImage, type FaceParams, type ServerToAvatar } from "../../server/src/protocol.ts";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // URL パラメータ
 //   transparent=1  背景を透過（OBS 用）
@@ -60,30 +62,87 @@ const unlockAudio = () => {
   }
 };
 
-// ---- モデル ----
+// ---- モデル（見た目の切り替え） ----
 let performer: Performer | null = null;
-let vrm: VRM | null = null;
+let face: FaceParams = DEFAULT_FACE;
+let currentFile = "";
+let loadingFile = "";
 
 const loader = new GLTFLoader();
 loader.register((parser) => new VRMLoaderPlugin(parser));
-loader.load(
-  modelUrl,
-  (gltf) => {
-    vrm = gltf.userData.vrm as VRM;
+const canvas = renderer.domElement;
+canvas.style.transition = "opacity 0.3s";
+
+/** VRM を読み込んで、今のモデルとふわっと入れ替える。 */
+async function wear(file: string, lookId = file) {
+  if (file === currentFile || file === loadingFile) return;
+  loadingFile = file;
+  try {
+    const gltf = await loader.loadAsync(file);
+    if (loadingFile !== file) return; // 読み込み中に別の見た目が指定された
+    const vrm = gltf.userData.vrm as VRM;
     VRMUtils.removeUnnecessaryVertices(gltf.scene);
     VRMUtils.combineSkeletons(gltf.scene);
     VRMUtils.rotateVRM0(vrm); // VRM0.x のモデルもカメラの方を向かせる
+
+    const old = performer;
+    if (old) {
+      canvas.style.opacity = "0";
+      await sleep(300);
+    }
+    const next = new Performer(vrm, camera, face);
+    if (old) {
+      next.setEmotion(old.currentEmotion);
+      scene.remove(old.vrm.scene);
+      VRMUtils.deepDispose(old.vrm.scene);
+    }
     scene.add(vrm.scene);
-    performer = new Performer(vrm, camera);
+    performer = next;
+    currentFile = file;
+    canvas.style.opacity = "1";
+    showNotice("");
     unlockAudio();
     (window as unknown as { aidolReady: boolean }).aidolReady = true;
-  },
-  undefined,
-  (err) => {
+  } catch (err) {
     console.error(err);
-    showNotice(`VRM モデルを読み込めませんでした: ${modelUrl}\navatar/public/models/avatar.vrm に VRM ファイルを置いてください`);
-  },
-);
+    send({ type: "look-failed", lookId, error: String(err) });
+    if (!performer) showNotice(`VRM モデルを読み込めませんでした: ${file}\navatar/public/models/ に VRM ファイルを置いてください`);
+  } finally {
+    if (loadingFile === file) loadingFile = "";
+  }
+}
+
+// サーバーから見た目の指定が来なければ、既定のモデルを表示する
+const fallback = setTimeout(() => void wear(modelUrl), params.has("model") ? 0 : 1500);
+
+/** レビュー用に、感情ごとの顔を撮影する。 */
+async function captureFaces(): Promise<CaptureImage[]> {
+  const p = performer;
+  if (!p) return [];
+  const before = p.currentEmotion;
+  const images: CaptureImage[] = [];
+  const crop = document.createElement("canvas");
+  crop.width = crop.height = 512;
+  const ctx = crop.getContext("2d")!;
+  for (const emotion of EMOTIONS) {
+    p.setEmotion(emotion);
+    await sleep(900);
+    renderer.render(scene, camera);
+    // 頭の位置を中心に正方形で切り出す
+    const head = p.vrm.humanoid.getNormalizedBoneNode("head")!.getWorldPosition(new THREE.Vector3());
+    head.y += 0.06;
+    const ndc = head.project(camera);
+    const cx = ((ndc.x + 1) / 2) * canvas.width;
+    const cy = ((1 - ndc.y) / 2) * canvas.height;
+    const size = canvas.height * (vertical ? 0.22 : 0.42);
+    ctx.fillStyle = "#8a8fa8";
+    ctx.fillRect(0, 0, 512, 512);
+    ctx.drawImage(canvas, cx - size / 2, cy - size / 2, size, size, 0, 0, 512, 512);
+    images.push({ emotion, png: crop.toDataURL("image/png").split(",")[1]! });
+  }
+  p.setEmotion(before);
+  return images;
+}
 
 speech.onStart = (msg) => {
   performer?.setEmotion(msg.emotion);
@@ -102,22 +161,48 @@ speech.onIdle = () => {
 };
 
 // ---- サーバー接続（切れたら再接続） ----
+let socket: WebSocket | null = null;
+function send(msg: AvatarToServer) {
+  if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+}
+
 function connect() {
   const ws = new WebSocket(`${serverUrl}/?role=avatar`);
-  ws.onmessage = (ev) => {
+  socket = ws;
+  ws.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data) as ServerToAvatar;
-    if (msg.type === "speak") speech.enqueue(msg);
-    else if (msg.type === "stop") {
-      speech.stop();
-      subtitle.textContent = "";
-    } else if (msg.type === "pose") performer?.gesture(msg.gesture);
+    switch (msg.type) {
+      case "speak":
+        speech.enqueue(msg);
+        break;
+      case "stop":
+        speech.stop();
+        subtitle.textContent = "";
+        break;
+      case "pose":
+        performer?.gesture(msg.gesture);
+        break;
+      case "look":
+        if (!params.has("model")) {
+          clearTimeout(fallback);
+          void wear(msg.look.file, msg.look.id);
+        }
+        break;
+      case "face":
+        face = msg.params;
+        if (performer) performer.face = face;
+        break;
+      case "capture":
+        send({ type: "capture-result", requestId: msg.requestId, images: await captureFaces() });
+        break;
+    }
   };
   ws.onclose = () => setTimeout(connect, 2000);
 }
 connect();
 
 // 開発用: ブラウザのコンソールから動きを試せるようにする
-Object.assign(window, { aidol: { gesture: (g: Parameters<Performer["gesture"]>[0]) => performer?.gesture(g), speech } });
+Object.assign(window, { aidol: { gesture: (g: Parameters<Performer["gesture"]>[0]) => performer?.gesture(g), speech, captureFaces } });
 
 // ---- ループ ----
 const clock = new THREE.Clock();

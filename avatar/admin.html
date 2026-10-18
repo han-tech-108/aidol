@@ -18,6 +18,10 @@
       #status { font-size: 13px; color: #888; }
       #log { font-family: ui-monospace, monospace; font-size: 12px; max-height: 360px; overflow: auto; white-space: pre-wrap; }
       .warn { color: #b26b00; } .error { color: #c22; }
+      .hint { font-size: 12px; color: #888; margin: 8px 0 0; }
+      .look { border: 1px solid #ccc; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+      .look.current { border-color: #3558d6; background: #eef2ff; }
+      .look.missing { color: #aaa; }
     </style>
   </head>
   <body>
@@ -40,6 +44,25 @@
         <textarea id="line" rows="2" placeholder="[joy][wave]みんな、こんばんは！"></textarea>
         <div class="row" style="margin-top: 8px"><button class="primary">喋らせる</button></div>
       </form>
+    </section>
+    <section>
+      <h2>見た目（衣装・髪型）</h2>
+      <div class="row">
+        <label>シーン <select id="scene"></select></label>
+        <button id="restyle">AIに選び直させる</button>
+        <span id="look-now" style="color: #555"></span>
+      </div>
+      <div id="looks" class="row" style="margin-top: 8px"></div>
+      <p class="hint">シーンを変えるとAIが見た目を選びます。配信中は「着替えて」「ポニテ見たい」などのコメントにも反応します。</p>
+    </section>
+    <section>
+      <h2>顔の継続改良</h2>
+      <div class="row">
+        <span id="face-version">顔: -</span>
+        <button id="face-review">今すぐレビュー</button>
+        <button id="face-rollback">前の版に戻す</button>
+      </div>
+      <p class="hint">配信中は一定時間ごとに各表情を撮影し、AIが調整します。反応が前の版より悪ければ自動で戻ります。</p>
     </section>
     <section>
       <h2>動作を試す</h2>

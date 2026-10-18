@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -8,18 +9,44 @@ import { VoicevoxClient } from "./tts.ts";
 import { buildSystemPrompt, loadCharacter } from "./character.ts";
 import { containsNgWord } from "./filter.ts";
 import { parseTags, SentenceSplitter } from "./tags.ts";
-import type { AdminToServer, Comment, Emotion, ServerToAdmin, ServerToAvatar, SpeakMessage } from "./protocol.ts";
+import { PreferenceTracker } from "./preferences.ts";
+import { Stylist, type StyleTrigger, type Wardrobe } from "./stylist.ts";
+import { FaceTuner } from "./face.ts";
+import { readJson } from "./store.ts";
+import type {
+  AdminState,
+  AdminToServer,
+  AvatarToServer,
+  CaptureImage,
+  Comment,
+  Emotion,
+  FaceParams,
+  ServerToAdmin,
+  ServerToAvatar,
+  SpeakMessage,
+} from "./protocol.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 8787);
 const MAX_PENDING = 5;
+const ROOT = path.join(here, "../..");
+const DATA = path.join(ROOT, "data");
+const MODEL = process.env.CLAUDE_MODEL ?? "claude-opus-5-5";
+/** 配信中、この時間ごとに顔のレビューを自動で行う（0 で無効） */
+const FACE_REVIEW_HOURS = Number(process.env.FACE_REVIEW_HOURS ?? 3);
 
-const character = loadCharacter(path.join(here, "../../config/character.json"));
-const brain = new Brain(
-  buildSystemPrompt(character),
-  process.env.CLAUDE_MODEL ?? "claude-opus-5-5",
-  (process.env.CLAUDE_EFFORT ?? "low") as "low",
+const character = loadCharacter(path.join(ROOT, "config/character.json"));
+const brain = new Brain(buildSystemPrompt(character), MODEL, (process.env.CLAUDE_EFFORT ?? "low") as "low");
+const prefs = new PreferenceTracker(path.join(DATA, "preferences.json"));
+const wardrobe = readJson<Wardrobe>(path.join(ROOT, "config/wardrobe.json"), { defaultLook: "", minMinutesBetweenChanges: 10, scenes: [], looks: [] });
+const stylist = new Stylist(
+  wardrobe,
+  (look) => existsSync(path.join(ROOT, "avatar/public", look.file)),
+  prefs,
+  MODEL,
+  path.join(DATA, "wishlist.md"),
 );
+const face = new FaceTuner(path.join(DATA, "face"), readJson<FaceParams>(path.join(ROOT, "config/face.json"), {} as FaceParams), prefs, MODEL);
 const tts = new VoicevoxClient(
   process.env.VOICEVOX_URL ?? "http://127.0.0.1:50021",
   Number(process.env.VOICEVOX_SPEAKER ?? 1),
@@ -34,15 +61,35 @@ function toAvatars(msg: ServerToAvatar) {
   for (const ws of avatars) if (ws.readyState === WebSocket.OPEN) ws.send(data);
 }
 
-function log(level: ServerToAdmin["level"], message: string) {
-  const entry: ServerToAdmin = { type: "log", level, at: new Date().toISOString(), message };
-  console[level === "info" ? "log" : level](`[${level}] ${message}`);
-  const data = JSON.stringify(entry);
+function toAdmins(msg: ServerToAdmin) {
+  const data = JSON.stringify(msg);
   for (const ws of admins) if (ws.readyState === WebSocket.OPEN) ws.send(data);
+}
+
+function log(level: "info" | "warn" | "error", message: string) {
+  console[level === "info" ? "log" : level](`[${level}] ${message}`);
+  toAdmins({ type: "log", level, at: new Date().toISOString(), message });
+}
+
+function adminState(): AdminState {
+  return {
+    type: "state",
+    scene: stylist.scene,
+    scenes: wardrobe.scenes,
+    look: stylist.current,
+    looks: wardrobe.looks.map((l) => ({ ...l, available: stylist.available().includes(l) })),
+    faceVersion: face.params.version,
+  };
 }
 
 // ---- 発話 ----
 let ttsAvailable = false;
+
+/** タグ付きの台詞をそのまま喋らせる。 */
+async function say(line: string) {
+  const s = parseTags(line);
+  if (s.text) toAvatars(await toSpeak(randomUUID(), 0, s.text, s.emotion ?? "neutral", s.gestures));
+}
 
 async function toSpeak(turnId: string, index: number, text: string, emotion: Emotion, gestures: SpeakMessage["gestures"]) {
   const msg: SpeakMessage = { type: "speak", turnId, index, text, emotion, gestures, duration: Math.max(1, text.length * 0.13) };
@@ -69,6 +116,7 @@ function enqueue(c: Comment) {
     log("warn", `NGワードを含むコメントを除外: ${c.author}`);
     return;
   }
+  if (prefs.observe(c, stylist.current.id, face.params.version)) scheduleRestyle();
   pending.push(c);
   while (pending.length > MAX_PENDING) pending.shift();
   void drain();
@@ -144,6 +192,89 @@ function stopAll() {
   log("warn", "管理画面から停止しました");
 }
 
+// ---- 見た目：衣装・髪型の自動選択 ----
+let restyleTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** 見た目についてのコメントは少しまとめてから判断する */
+function scheduleRestyle() {
+  clearTimeout(restyleTimer);
+  restyleTimer = setTimeout(() => void restyle("request"), 45_000);
+}
+
+async function restyle(trigger: StyleTrigger) {
+  try {
+    const d = await stylist.decide(trigger);
+    if (!d) return;
+    log("info", `スタイリスト: ${d.look.name}（${d.reason}）`);
+    if (d.changed) {
+      toAvatars({ type: "look", look: d.look });
+      await say(d.line);
+    }
+    toAdmins(adminState());
+  } catch (e) {
+    log("error", `見た目の選択に失敗: ${(e as Error).message}`);
+  }
+}
+
+// ---- 顔の継続改良 ----
+const captures = new Map<string, (images: CaptureImage[]) => void>();
+
+function capture(): Promise<CaptureImage[]> {
+  const ws = [...avatars].find((a) => a.readyState === WebSocket.OPEN);
+  if (!ws) return Promise.reject(new Error("アバターが接続されていません"));
+  const requestId = randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      captures.delete(requestId);
+      reject(new Error("顔の撮影がタイムアウトしました"));
+    }, 30_000);
+    captures.set(requestId, (images) => {
+      clearTimeout(timer);
+      resolve(images);
+    });
+    ws.send(JSON.stringify({ type: "capture", requestId } satisfies ServerToAvatar));
+  });
+}
+
+let reviewing = false;
+let minutesSinceReview = 0;
+
+async function reviewFace() {
+  if (reviewing) return;
+  reviewing = true;
+  minutesSinceReview = 0;
+  try {
+    log("info", "顔のレビューを始めます（各表情を撮影中）");
+    const result = await face.review(await capture(), stylist.current);
+    if (result.kind === "updated") {
+      log("info", `顔を版${result.params.version}に更新: ${result.assessment}`);
+      if (result.modelSuggestions.length) log("info", `モデル修正の提案 ${result.modelSuggestions.length}件を data/face/model-suggestions.md に記録`);
+    } else {
+      log("warn", `顔を前の版に戻しました: ${result.reason}`);
+    }
+    toAvatars({ type: "face", params: face.params });
+    toAdmins(adminState());
+  } catch (e) {
+    log("error", `顔のレビューに失敗: ${(e as Error).message}`);
+  } finally {
+    reviewing = false;
+  }
+}
+
+// 配信中（アバター接続中）は1分ごとに見た目の表示時間を数え、反応が悪い版は自動で戻す
+setInterval(() => {
+  if (!avatars.size) return;
+  prefs.tick(stylist.current.id, face.params.version);
+  minutesSinceReview++;
+  const rolled = face.checkRollback();
+  if (rolled?.kind === "rolled-back") {
+    log("warn", `顔を前の版に戻しました: ${rolled.reason}`);
+    toAvatars({ type: "face", params: face.params });
+    toAdmins(adminState());
+  }
+  if (FACE_REVIEW_HOURS > 0 && minutesSinceReview >= FACE_REVIEW_HOURS * 60) void reviewFace();
+}, 60_000);
+
 function escapeAttr(s: string) {
   return s.replace(/[&"<>]/g, (ch) => `&#${ch.charCodeAt(0)};`);
 }
@@ -167,10 +298,23 @@ wss.on("connection", (ws, req) => {
   if (role === "avatar") {
     avatars.add(ws);
     log("info", `アバターが接続しました（${avatars.size}）`);
+    ws.send(JSON.stringify({ type: "look", look: stylist.current } satisfies ServerToAvatar));
+    ws.send(JSON.stringify({ type: "face", params: face.params } satisfies ServerToAvatar));
     ws.on("close", () => avatars.delete(ws));
+    ws.on("message", (data) => {
+      let msg: AvatarToServer;
+      try {
+        msg = JSON.parse(String(data));
+      } catch {
+        return;
+      }
+      if (msg.type === "capture-result") captures.get(msg.requestId)?.(msg.images);
+      else if (msg.type === "look-failed") log("error", `見た目 ${msg.lookId} の読み込みに失敗: ${msg.error}`);
+    });
     return;
   }
   admins.add(ws);
+  ws.send(JSON.stringify(adminState()));
   ws.on("close", () => admins.delete(ws));
   ws.on("message", async (data) => {
     let msg: AdminToServer;
@@ -183,9 +327,36 @@ wss.on("connection", (ws, req) => {
       case "comment":
         enqueue({ source: "admin", author: msg.author || "名無し", text: msg.text });
         break;
-      case "say": {
-        const s = parseTags(msg.text);
-        if (s.text) toAvatars(await toSpeak(randomUUID(), 0, s.text, s.emotion ?? "neutral", s.gestures));
+      case "say":
+        await say(msg.text);
+        break;
+      case "scene":
+        stylist.scene = msg.scene;
+        log("info", `シーンを「${msg.scene}」に変更`);
+        await restyle("scene");
+        break;
+      case "restyle":
+        await restyle("manual");
+        break;
+      case "wear": {
+        const look = stylist.wear(msg.lookId);
+        if (look) {
+          toAvatars({ type: "look", look });
+          log("info", `手動で着替え: ${look.name}`);
+        }
+        toAdmins(adminState());
+        break;
+      }
+      case "face-review":
+        void reviewFace();
+        break;
+      case "face-rollback": {
+        const p = face.rollback();
+        if (p) {
+          toAvatars({ type: "face", params: p });
+          log("warn", `顔を版${p.version}に戻しました`);
+          toAdmins(adminState());
+        }
         break;
       }
       case "gesture":

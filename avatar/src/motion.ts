@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import type { VRM, VRMHumanBoneName } from "@pixiv/three-vrm";
-import type { Emotion, Gesture, Vowel } from "../../server/src/protocol.ts";
+import { FACE_EXPRESSIONS, type Emotion, type FaceParams, type Gesture, type Vowel } from "../../server/src/protocol.ts";
 
 type Pose = Partial<Record<VRMHumanBoneName, [number, number, number]>>;
 
@@ -49,15 +49,23 @@ const GESTURES: Record<Gesture, GestureDef> = {
   },
 };
 
-const EMOTION_EXPRESSIONS: Record<Emotion, Record<string, number>> = {
-  neutral: {},
-  joy: { happy: 0.75 },
-  fun: { relaxed: 0.7 },
-  angry: { angry: 0.7 },
-  sorrow: { sad: 0.7 },
-  surprised: { surprised: 0.8 },
+/** サーバーから顔の調整値が届くまでの初期値（config/face.json と同じ）。 */
+export const DEFAULT_FACE: FaceParams = {
+  version: 0,
+  emotions: {
+    neutral: {},
+    joy: { happy: 0.75 },
+    fun: { relaxed: 0.7 },
+    angry: { angry: 0.7 },
+    sorrow: { sad: 0.7 },
+    surprised: { surprised: 0.8 },
+  },
+  mouthGain: 1,
+  blinkMin: 1.5,
+  blinkMax: 6,
+  gazeJitter: 0.25,
+  note: "",
 };
-const FACE_KEYS = ["happy", "relaxed", "angry", "sad", "surprised"];
 
 const VOWEL_EXPRESSIONS: Record<Vowel, Record<string, number>> = {
   a: { aa: 0.9 },
@@ -86,10 +94,15 @@ export class Performer {
   private nextSaccade = 0;
 
   constructor(
-    private vrm: VRM,
+    readonly vrm: VRM,
     private camera: THREE.Camera,
+    public face: FaceParams = DEFAULT_FACE,
   ) {
     if (vrm.lookAt) vrm.lookAt.target = this.gaze;
+  }
+
+  get currentEmotion() {
+    return this.emotion;
   }
 
   gesture(g: Gesture) {
@@ -140,11 +153,12 @@ export class Performer {
   private updateFace(dt: number, t: number, vowel: Vowel | null) {
     const em = this.vrm.expressionManager;
     if (!em) return;
-    const face = EMOTION_EXPRESSIONS[this.emotion];
-    for (const k of FACE_KEYS) this.set(em, k, approach(this.weights.get(k) ?? 0, face[k] ?? 0, 6, dt));
+    const target = this.face.emotions[this.emotion] ?? {};
+    for (const k of FACE_EXPRESSIONS) this.set(em, k, approach(this.weights.get(k) ?? 0, target[k] ?? 0, 6, dt));
 
     const mouth = vowel ? VOWEL_EXPRESSIONS[vowel] : {};
-    for (const k of MOUTH_KEYS) this.set(em, k, approach(this.weights.get(k) ?? 0, mouth[k] ?? 0, 22, dt));
+    const gain = this.face.mouthGain;
+    for (const k of MOUTH_KEYS) this.set(em, k, approach(this.weights.get(k) ?? 0, Math.min(1, (mouth[k] ?? 0) * gain), 22, dt));
 
     // 笑顔で目を細めているときはまばたきしない
     if (t > this.nextBlink && this.blinkStart < 0) this.blinkStart = t;
@@ -154,7 +168,7 @@ export class Performer {
       blink = b < 1 ? Math.sin(b * Math.PI) : 0;
       if (b >= 1) {
         this.blinkStart = -1;
-        this.nextBlink = t + 1.5 + Math.random() * 4.5;
+        this.nextBlink = t + this.face.blinkMin + Math.random() * (this.face.blinkMax - this.face.blinkMin);
       }
     }
     this.set(em, "blink", blink * (1 - (this.weights.get("happy") ?? 0)));
@@ -168,7 +182,8 @@ export class Performer {
   private updateGaze(t: number) {
     // カメラを見つつ、ときどき視線を少しだけずらす
     if (t > this.nextSaccade) {
-      this.gazeOffset.set((Math.random() - 0.5) * 0.25, (Math.random() - 0.5) * 0.12, 0);
+      const j = this.face.gazeJitter;
+      this.gazeOffset.set((Math.random() - 0.5) * j, (Math.random() - 0.5) * j * 0.5, 0);
       this.nextSaccade = t + 0.8 + Math.random() * 2.5;
     }
     this.camera.getWorldPosition(this.gaze.position);

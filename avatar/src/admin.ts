@@ -1,4 +1,4 @@
-import { GESTURES, type AdminToServer, type ServerToAdmin } from "../../server/src/protocol.ts";
+import { GESTURES, type AdminState, type AdminToServer, type ServerToAdmin } from "../../server/src/protocol.ts";
 
 const params = new URLSearchParams(location.search);
 const serverUrl = params.get("server") ?? `ws://${location.hostname || "localhost"}:8787`;
@@ -16,6 +16,7 @@ function connect() {
   };
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data) as ServerToAdmin;
+    if (msg.type === "state") return renderState(msg);
     const line = document.createElement("div");
     line.className = msg.level;
     line.textContent = `${new Date(msg.at).toLocaleTimeString()} ${msg.message}`;
@@ -42,3 +43,26 @@ for (const g of GESTURES) {
   b.onclick = () => send({ type: "gesture", gesture: g });
   $("gestures").appendChild(b);
 }
+
+function renderState(st: AdminState) {
+  const scene = $<HTMLSelectElement>("scene");
+  scene.replaceChildren(...st.scenes.map((name) => new Option(name, name, false, name === st.scene)));
+  $("look-now").textContent = `いま: ${st.look.name}`;
+  $("looks").replaceChildren(
+    ...st.looks.map((l) => {
+      const b = document.createElement("button");
+      b.className = `look${l.id === st.look.id ? " current" : ""}${l.available ? "" : " missing"}`;
+      b.textContent = l.available ? l.name : `${l.name}（VRM未配置）`;
+      b.title = `${l.outfit} / ${l.hair} / ${l.file}`;
+      b.disabled = !l.available;
+      b.onclick = () => send({ type: "wear", lookId: l.id });
+      return b;
+    }),
+  );
+  $("face-version").textContent = `顔: 版${st.faceVersion}`;
+}
+
+$("scene").addEventListener("change", (e) => send({ type: "scene", scene: (e.target as HTMLSelectElement).value }));
+$("restyle").addEventListener("click", () => send({ type: "restyle" }));
+$("face-review").addEventListener("click", () => send({ type: "face-review" }));
+$("face-rollback").addEventListener("click", () => send({ type: "face-rollback" }));

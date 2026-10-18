@@ -1,0 +1,39 @@
+{
+  "defaultLook": "casual-long",
+  "minMinutesBetweenChanges": 10,
+  "scenes": ["雑談", "歌枠", "ゲーム", "朝配信", "深夜配信", "お祝い・記念"],
+  "looks": [
+    {
+      "id": "casual-long",
+      "name": "白Tシャツ×ロングヘア",
+      "file": "/models/avatar.vrm",
+      "outfit": "白い半袖Tシャツのカジュアルな普段着",
+      "hair": "茶色のロングストレート",
+      "tags": ["雑談", "ゲーム", "普段"]
+    },
+    {
+      "id": "idol-twintail",
+      "name": "ステージ衣装×ツインテール",
+      "file": "/models/idol-twintail.vrm",
+      "outfit": "フリルの付いたアイドルのステージ衣装",
+      "hair": "高い位置のツインテール",
+      "tags": ["歌枠", "お祝い・記念", "華やか"]
+    },
+    {
+      "id": "pajama-bun",
+      "name": "パジャマ×おだんご",
+      "file": "/models/pajama-bun.vrm",
+      "outfit": "ゆったりしたパステルカラーのパジャマ",
+      "hair": "ゆるいおだんごヘア",
+      "tags": ["深夜配信", "まったり"]
+    },
+    {
+      "id": "uniform-ponytail",
+      "name": "制服×ポニーテール",
+      "file": "/models/uniform-ponytail.vrm",
+      "outfit": "ブレザーの制服",
+      "hair": "ポニーテール",
+      "tags": ["朝配信", "ゲーム", "元気"]
+    }
+  ]
+}

@@ -36,17 +36,77 @@ export interface SpeakMessage {
   duration: number;
 }
 
-export type ServerToAvatar = SpeakMessage | { type: "stop" } | { type: "pose"; gesture: Gesture };
+export const FACE_EXPRESSIONS = ["happy", "relaxed", "angry", "sad", "surprised"] as const;
+export type FaceExpression = (typeof FACE_EXPRESSIONS)[number];
+
+/** 衣装と髪型の組み合わせ1つ分。VRM ファイル1つに対応する。 */
+export interface Look {
+  id: string;
+  name: string;
+  /** avatar/public からのパス */
+  file: string;
+  outfit: string;
+  hair: string;
+  tags: string[];
+}
+
+/** 顔の見せ方の調整値。AI のレビューで少しずつ更新され、版ごとに履歴が残る。 */
+export interface FaceParams {
+  version: number;
+  emotions: Record<Emotion, Partial<Record<FaceExpression, number>>>;
+  /** 口の開き具合の倍率 */
+  mouthGain: number;
+  /** まばたきの間隔（秒） */
+  blinkMin: number;
+  blinkMax: number;
+  /** 視線のゆらぎの大きさ */
+  gazeJitter: number;
+  note: string;
+}
+
+export interface CaptureImage {
+  emotion: Emotion;
+  /** PNG を base64 にしたもの */
+  png: string;
+}
+
+export type ServerToAvatar =
+  | SpeakMessage
+  | { type: "stop" }
+  | { type: "pose"; gesture: Gesture }
+  | { type: "look"; look: Look }
+  | { type: "face"; params: FaceParams }
+  | { type: "capture"; requestId: string };
+
+export type AvatarToServer =
+  | { type: "capture-result"; requestId: string; images: CaptureImage[] }
+  | { type: "look-failed"; lookId: string; error: string };
 
 export type AdminToServer =
   | { type: "comment"; author: string; text: string }
   | { type: "say"; text: string }
   | { type: "stop" }
-  | { type: "gesture"; gesture: Gesture };
+  | { type: "gesture"; gesture: Gesture }
+  | { type: "scene"; scene: string }
+  | { type: "restyle" }
+  | { type: "wear"; lookId: string }
+  | { type: "face-review" }
+  | { type: "face-rollback" };
 
-export type ServerToAdmin = {
-  type: "log";
-  level: "info" | "warn" | "error";
-  at: string;
-  message: string;
-};
+export interface AdminState {
+  type: "state";
+  scene: string;
+  scenes: string[];
+  look: Look;
+  looks: (Look & { available: boolean })[];
+  faceVersion: number;
+}
+
+export type ServerToAdmin =
+  | {
+      type: "log";
+      level: "info" | "warn" | "error";
+      at: string;
+      message: string;
+    }
+  | AdminState;

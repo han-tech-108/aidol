@@ -3,3 +3,4 @@ dist/
 .env
 avatar/public/models/*.vrm
 logs/
+data/
